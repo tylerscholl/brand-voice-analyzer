@@ -1,5 +1,49 @@
 import Anthropic from "@anthropic-ai/sdk";
 
+// ─── Rate Limiting ───
+// Simple in-memory rate limiter. Resets when the server restarts (on Vercel, 
+// serverless functions restart frequently so this is conservative by design).
+
+const DAILY_LIMIT = 50;        // Max analyses per day across ALL users
+const PER_IP_HOURLY_LIMIT = 5; // Max analyses per person per hour
+
+let dailyCount = 0;
+let dailyResetTime = Date.now() + 24 * 60 * 60 * 1000;
+const ipTracker = new Map(); // IP -> { count, resetTime }
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+
+  // Reset daily counter
+  if (now > dailyResetTime) {
+    dailyCount = 0;
+    dailyResetTime = now + 24 * 60 * 60 * 1000;
+  }
+
+  // Check daily limit
+  if (dailyCount >= DAILY_LIMIT) {
+    return { allowed: false, reason: "Daily analysis limit reached. Try again tomorrow." };
+  }
+
+  // Check per-IP limit
+  const ipData = ipTracker.get(ip) || { count: 0, resetTime: now + 60 * 60 * 1000 };
+  if (now > ipData.resetTime) {
+    ipData.count = 0;
+    ipData.resetTime = now + 60 * 60 * 1000;
+  }
+  if (ipData.count >= PER_IP_HOURLY_LIMIT) {
+    return { allowed: false, reason: "You've reached the hourly limit. Try again in a bit." };
+  }
+
+  // Increment counters
+  dailyCount++;
+  ipData.count++;
+  ipTracker.set(ip, ipData);
+
+  return { allowed: true };
+}
+
+
 const ANALYSIS_PROMPT = `You are an expert brand strategist and voice analyst. Analyze the following website content and provide a comprehensive brand voice audit.
 
 SCORING RUBRIC — use these definitions to score each dimension from 0-100:
@@ -60,6 +104,13 @@ Return your analysis as a JSON object with this exact structure (no markdown, no
 
 export async function POST(request) {
   try {
+    // Rate limit check
+    const ip = request.headers.get("x-forwarded-for") || request.headers.get("x-real-ip") || "unknown";
+    const rateCheck = checkRateLimit(ip);
+    if (!rateCheck.allowed) {
+      return Response.json({ error: rateCheck.reason }, { status: 429 });
+    }
+
     const { url } = await request.json();
 
     if (!url) {
